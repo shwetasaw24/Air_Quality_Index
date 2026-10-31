@@ -1,0 +1,17 @@
+# AirStream - Big Data Air Quality Analytics and Real-Time Monitoring
+
+# Big data processing
+pyspark==4.2.0
+py4j==0.10.9.9
+
+# Data processing and storage
+pandas==3.0.5
+numpy==2.5.2
+pyarrow==25.0.1
+
+# Kafka streaming
+kafka-python==3.0.11
+
+# Dashboard and visualization
+streamlit==1.66.1
+plotly==7.1.0

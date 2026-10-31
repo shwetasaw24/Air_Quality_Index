@@ -1,0 +1,34 @@
+AIRSTREAM DATA SKEW EXPERIMENT
+==================================================
+
+Total records: 30,415,294
+Station count: 75
+Repartition target: 8
+Repartition + count time: 6.95 seconds
+
+ORIGINAL PARTITIONS
+partitions: 74
+total_records: 30415294
+min_records: 36
+max_records: 2091848
+average_records: 411017.49
+max_min_ratio: 58106.89
+coefficient_of_variation: 1.3411
+
+REPARTITIONED PARTITIONS
+partitions: 8
+total_records: 30415294
+min_records: 3801906
+max_records: 3801916
+average_records: 3801911.75
+max_min_ratio: 1.0
+coefficient_of_variation: 0.0
+
+STATION DISTRIBUTION
+partitions: 75
+total_records: 30415294
+min_records: 22355
+max_records: 580295
+average_records: 405537.25
+max_min_ratio: 25.96
+coefficient_of_variation: 0.2702
