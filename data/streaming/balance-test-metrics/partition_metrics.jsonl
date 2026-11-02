@@ -1,0 +1,1 @@
+{"batch_id": 0, "recorded_at": "2026-11-01T06:09:46.804215+00:00", "total_records": 500, "kafka_partition_counts": {"0": 167, "1": 167, "2": 166}, "spark_partition_counts": {"0": 167, "1": 167, "2": 166}}

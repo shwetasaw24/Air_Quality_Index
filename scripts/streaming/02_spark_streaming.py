@@ -9,6 +9,7 @@ from pyspark.sql.functions import (
     count,
     from_json,
     max as spark_max,
+    spark_partition_id,
     to_date,
     when,
     window,
@@ -31,8 +32,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 KAFKA_SERVER = "localhost:9092"
 KAFKA_TOPIC = "air-quality"
 
-CHECKPOINT_PATH = PROJECT_ROOT / "data" / "streaming" / "checkpoint"
-OUTPUT_PATH = PROJECT_ROOT / "data" / "streaming" / "output"
+CHECKPOINT_PATH = PROJECT_ROOT / "data" / "streaming" / "balance-test-checkpoint"
+OUTPUT_PATH = PROJECT_ROOT / "data" / "streaming" / "balance-test-output"
+
+
+METRICS_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "streaming"
+    / "balance-test-metrics"
+)
+
+METRICS_PATH.mkdir(parents=True, exist_ok=True)
 
 CHECKPOINT_PATH.mkdir(parents=True, exist_ok=True)
 OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
@@ -153,8 +164,12 @@ raw_stream = (
 
 events = (
     raw_stream
-    .select(from_json(col("value").cast("string"), schema).alias("data"))
-    .select("data.*")
+    .select(
+        col("partition").alias("kafka_partition"),
+        col("offset").alias("kafka_offset"),
+        from_json(col("value").cast("string"), schema).alias("data"),
+    )
+    .select("kafka_partition", "kafka_offset", "data.*")
     .withColumn("event_time", col("datetime").cast(TimestampType()))
     .filter(col("event_time").isNotNull())
     .filter(col("value").isNotNull())
@@ -167,24 +182,69 @@ events = (
 )
 
 # --------------------------------------------------
-# Five-minute event-time window aggregation
+# Per-microbatch partition monitoring
 # --------------------------------------------------
 
-windowed = (
-    events
-    .withWatermark("event_time", "10 minutes")
-    .groupBy(
-        window(col("event_time"), "5 minutes"),
-        col("location_id"),
-        col("location"),
-        col("parameter"),
+import json
+from datetime import datetime, timezone
+
+
+def monitor_partitions(batch_df, batch_id):
+    if batch_df.isEmpty():
+        print(f"Batch {batch_id}: no valid events.")
+        return
+
+    # Count records received from each Kafka partition.
+    kafka_distribution = (
+        batch_df
+        .groupBy("kafka_partition")
+        .count()
+        .orderBy("kafka_partition")
+        .collect()
     )
-    .agg(
-        avg("value").alias("avg_value"),
-        spark_max("value").alias("max_value"),
-        count("*").alias("measurement_count"),
+
+    # Count records processed by each Spark execution partition.
+    spark_distribution = (
+        batch_df
+        .withColumn(
+            "spark_partition",
+            spark_partition_id()
+        )
+        .groupBy("spark_partition")
+        .count()
+        .orderBy("spark_partition")
+        .collect()
     )
-)
+
+    kafka_counts = {
+        str(row["kafka_partition"]): row["count"]
+        for row in kafka_distribution
+    }
+
+    spark_counts = {
+        str(row["spark_partition"]): row["count"]
+        for row in spark_distribution
+    }
+
+    total_records = sum(kafka_counts.values())
+
+    metric = {
+        "batch_id": batch_id,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "total_records": total_records,
+        "kafka_partition_counts": kafka_counts,
+        "spark_partition_counts": spark_counts,
+    }
+
+    metrics_file = METRICS_PATH / "partition_metrics.jsonl"
+
+    with open(metrics_file, "a", encoding="utf-8") as file:
+        file.write(json.dumps(metric) + "\n")
+
+    print(f"\nPartition monitoring - Batch {batch_id}")
+    print(f"Total records: {total_records}")
+    print(f"Kafka partition counts: {kafka_counts}")
+    print(f"Spark processing partition counts: {spark_counts}")
 
 # --------------------------------------------------
 # Threshold-based anomaly detection
@@ -226,24 +286,146 @@ result = (
 )
 
 # --------------------------------------------------
-# Persist results to Parquet with checkpointing
+# Persist results and monitor partition distribution
 # --------------------------------------------------
 
-print("Starting persistent streaming query...")
+import json
+from datetime import datetime, timezone
+
+
+def process_batch(batch_df, batch_id):
+    if batch_df.isEmpty():
+        print(f"Batch {batch_id}: no valid events.")
+        return
+
+    # 1. Measure Kafka partition distribution.
+    kafka_rows = (
+        batch_df
+        .groupBy("kafka_partition")
+        .count()
+        .orderBy("kafka_partition")
+        .collect()
+    )
+
+    kafka_counts = {
+        str(row["kafka_partition"]): row["count"]
+        for row in kafka_rows
+    }
+
+    # 2. Measure Spark execution partition distribution.
+    spark_rows = (
+        batch_df
+        .withColumn(
+            "spark_partition",
+            spark_partition_id()
+        )
+        .groupBy("spark_partition")
+        .count()
+        .orderBy("spark_partition")
+        .collect()
+    )
+
+    spark_counts = {
+        str(row["spark_partition"]): row["count"]
+        for row in spark_rows
+    }
+
+    # 3. Record monitoring metrics.
+    metric = {
+        "batch_id": batch_id,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "total_records": sum(kafka_counts.values()),
+        "kafka_partition_counts": kafka_counts,
+        "spark_partition_counts": spark_counts,
+    }
+
+    metrics_file = METRICS_PATH / "partition_metrics.jsonl"
+
+    with open(metrics_file, "a", encoding="utf-8") as file:
+        file.write(json.dumps(metric) + "\n")
+
+    print(f"\nPartition monitoring - Batch {batch_id}")
+    print(f"Kafka distribution: {kafka_counts}")
+    print(f"Spark distribution: {spark_counts}")
+
+    # 4. Run the existing window aggregation and anomaly detection.
+    batch_events = batch_df.drop("kafka_partition", "kafka_offset")
+
+    batch_windowed = (
+        batch_events
+        .withWatermark("event_time", "10 minutes")
+        .groupBy(
+            window(col("event_time"), "5 minutes"),
+            col("location_id"),
+            col("location"),
+            col("parameter"),
+        )
+        .agg(
+            avg("value").alias("avg_value"),
+            spark_max("value").alias("max_value"),
+            count("*").alias("measurement_count"),
+        )
+    )
+
+    batch_result = (
+        batch_windowed
+        .select(
+            col("window.start").alias("window_start"),
+            col("window.end").alias("window_end"),
+            col("location_id"),
+            col("location"),
+            col("parameter"),
+            col("avg_value"),
+            col("max_value"),
+            col("measurement_count"),
+        )
+        .withColumn("date", to_date(col("window_start")))
+        .withColumn(
+            "anomaly_threshold",
+            when(col("parameter") == "pm25", ANOMALY_THRESHOLDS["pm25"])
+            .when(col("parameter") == "pm10", ANOMALY_THRESHOLDS["pm10"])
+            .when(col("parameter") == "no2", ANOMALY_THRESHOLDS["no2"])
+            .when(col("parameter") == "so2", ANOMALY_THRESHOLDS["so2"])
+            .when(col("parameter") == "co", ANOMALY_THRESHOLDS["co"])
+            .when(col("parameter") == "o3", ANOMALY_THRESHOLDS["o3"]),
+        )
+        .withColumn(
+            "anomaly_flag",
+            col("avg_value") > col("anomaly_threshold"),
+        )
+        .withColumn(
+            "anomaly_reason",
+            when(
+                col("anomaly_flag"),
+                "Window average exceeded project threshold",
+            ).otherwise(""),
+        )
+    )
+
+    # 5. Save this batch's results.
+    (
+        batch_result.write
+        .format("parquet")
+        .mode("append")
+        .partitionBy("date")
+        .save(str(OUTPUT_PATH))
+    )
+
+    print(f"Batch {batch_id}: results saved.")
+
+
+print("Starting unified Spark streaming query...")
 
 query = (
-    result.writeStream
-    .format("parquet")
-    .outputMode("append")
-    .option("path", str(OUTPUT_PATH))
+    events.writeStream
+    .foreachBatch(process_batch)
     .option("checkpointLocation", str(CHECKPOINT_PATH))
-    .partitionBy("date")
     .trigger(processingTime="10 seconds")
     .start()
 )
 
-print("AirStream streaming query is running.")
-print("Writing window aggregates and anomaly flags to Parquet.")
+print("AirStream unified streaming query is running.")
+print("Monitoring partitions and writing window aggregates.")
 print("Press Ctrl+C to stop.")
 
 try:
@@ -251,7 +433,14 @@ try:
 except KeyboardInterrupt:
     print("\nStopping AirStream streaming query...")
 finally:
-    if query.isActive:
+    try:
         query.stop()
-    spark.stop()
+    except Exception as exc:
+        print(f"Query shutdown warning: {exc}")
+
+    try:
+        spark.stop()
+    except Exception as exc:
+        print(f"Spark shutdown warning: {exc}")
+
     print("Streaming stopped.")

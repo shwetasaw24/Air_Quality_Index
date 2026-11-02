@@ -16,10 +16,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SILVER_PATH = PROJECT_ROOT / "data" / "processed" / "silver"
 
 KAFKA_SERVER = "localhost:9092"
-KAFKA_TOPIC = "air-quality"
+KAFKA_TOPIC = "air-quality-balance-test"
 
 # Small test batch first
 MAX_EVENTS = 500
+KAFKA_PARTITIONS = 3
 
 # Delay between simulated sensor events
 DELAY_SECONDS = 0.2
@@ -127,11 +128,16 @@ print()
 
 
 # --------------------------------------------------
-# Send events
+# Send events with explicit round-robin partitioning
 # --------------------------------------------------
 
-print("Sending events...")
+print("Sending events with round-robin partition assignment...")
 print("-" * 60)
+
+partition_counts = {
+    partition_id: 0
+    for partition_id in range(KAFKA_PARTITIONS)
+}
 
 for index, row in enumerate(records, start=1):
 
@@ -146,30 +152,59 @@ for index, row in enumerate(records, start=1):
         "lon": float(row["lon"]) if row["lon"] is not None else None,
     }
 
-    future = producer.send(KAFKA_TOPIC, value=event)
+    # Explicit round-robin assignment
+    target_partition = (index - 1) % KAFKA_PARTITIONS
+
+    future = producer.send(
+        KAFKA_TOPIC,
+        value=event,
+        partition=target_partition,
+    )
 
     metadata = future.get(timeout=10)
 
+    partition_counts[metadata.partition] += 1
+
     print(
-        f"[{index:02d}] "
-        f"{event['datetime']} | "
+        f"[{index:03d}] "
         f"station={event['location_id']} | "
-        f"{event['parameter']}={event['value']} "
-        f"{event['units']} | "
-        f"partition={metadata.partition} "
+        f"{event['parameter']}={event['value']} | "
+        f"partition={metadata.partition} | "
         f"offset={metadata.offset}"
     )
 
     time.sleep(DELAY_SECONDS)
 
-
-# Make sure all buffered messages are delivered
 producer.flush()
 producer.close()
 
-spark.stop()
+# --------------------------------------------------
+# Partition distribution summary
+# --------------------------------------------------
 
-print()
+print("\n" + "=" * 60)
+print("KAFKA PARTITION DISTRIBUTION")
 print("=" * 60)
-print("Producer test completed successfully.")
-print("=" * 60)
+
+total_sent = sum(partition_counts.values())
+
+for partition_id, message_count in partition_counts.items():
+    percentage = (
+        message_count / total_sent * 100
+        if total_sent else 0
+    )
+
+    print(
+        f"Partition {partition_id}: "
+        f"{message_count} messages ({percentage:.2f}%)"
+    )
+
+print("-" * 60)
+print(f"Total messages sent: {total_sent}")
+
+if total_sent != len(records):
+    raise RuntimeError("Message count mismatch!")
+
+print("Producer distribution validation: PASSED")
+
+spark.stop()
